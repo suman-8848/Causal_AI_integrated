@@ -142,8 +142,8 @@ def train_fair_cfrnet(X, T, Y, A, Y_cf=None, mu0=None, mu1=None, lambda_fairness
             
             optimizer.zero_grad()
             
-            # Forward pass - returns te, pe_hat, d_theta, propensity, phi
-            te, pe_hat, d_theta, propensity, phi = model(batch_X, batch_A, batch_T)
+            # Forward pass - returns te_unconstrained, te_fair, pe_hat, d_theta, propensity, phi
+            te_unconstrained, te_fair, pe_hat, d_theta, propensity, phi = model(batch_X, batch_A, batch_T)
             
             # Separate treated and control for IPM
             treated_mask = batch_T == 1
@@ -156,9 +156,9 @@ def train_fair_cfrnet(X, T, Y, A, Y_cf=None, mu0=None, mu1=None, lambda_fairness
             else:
                 ipm_loss = torch.tensor(0.0, device=device)
             
-            # Compute total loss
-            total_loss, pred_loss, ipm_loss_val, fairness_loss_val = model.compute_loss(
-                te, batch_Y, batch_T, phi, pe_hat, d_theta, ipm_loss
+            # Compute total loss (uses fair predictions)
+            total_loss, pred_loss, ipm_loss_val, constraint_loss_val = model.compute_loss(
+                te_unconstrained, te_fair, batch_Y, batch_T, phi, pe_hat, ipm_loss
             )
             
             # Backward pass
@@ -168,7 +168,7 @@ def train_fair_cfrnet(X, T, Y, A, Y_cf=None, mu0=None, mu1=None, lambda_fairness
             train_loss += total_loss.item()
             train_pred_loss += pred_loss.item()
             train_ipm_loss += ipm_loss_val.item()
-            train_fairness_penalty += fairness_loss_val.item()
+            train_fairness_penalty += constraint_loss_val.item()
         
         # Validation
         model.eval()
@@ -184,7 +184,7 @@ def train_fair_cfrnet(X, T, Y, A, Y_cf=None, mu0=None, mu1=None, lambda_fairness
                 batch_Y = batch_Y.to(device)
                 batch_A = batch_A.to(device)
                 
-                te, pe_hat, d_theta, propensity, phi = model(batch_X, batch_A, batch_T)
+                te_unconstrained, te_fair, pe_hat, d_theta, propensity, phi = model(batch_X, batch_A, batch_T)
                 
                 # Separate treated and control
                 treated_mask = batch_T == 1
@@ -197,14 +197,14 @@ def train_fair_cfrnet(X, T, Y, A, Y_cf=None, mu0=None, mu1=None, lambda_fairness
                 else:
                     ipm_loss = torch.tensor(0.0, device=device)
                 
-                total_loss, pred_loss, ipm_loss_val, fairness_loss_val = model.compute_loss(
-                    te, batch_Y, batch_T, phi, pe_hat, d_theta, ipm_loss
+                total_loss, pred_loss, ipm_loss_val, constraint_loss_val = model.compute_loss(
+                    te_unconstrained, te_fair, batch_Y, batch_T, phi, pe_hat, ipm_loss
                 )
                 
                 val_loss += total_loss.item()
                 val_pred_loss += pred_loss.item()
                 val_ipm_loss += ipm_loss_val.item()
-                val_fairness_penalty += fairness_loss_val.item()
+                val_fairness_penalty += constraint_loss_val.item()
         
         avg_train_loss = train_loss / len(train_loader)
         avg_val_loss = val_loss / len(val_loader)
@@ -245,7 +245,9 @@ def train_fair_cfrnet(X, T, Y, A, Y_cf=None, mu0=None, mu1=None, lambda_fairness
     T_tensor = torch.FloatTensor(T).to(device)
     
     with torch.no_grad():
-        te_full, pe_hat_full, d_theta_full, propensity_full, phi_full = model(X_scaled_tensor, A_tensor, T_tensor)
+        te_unconstrained_full, te_fair_full, pe_hat_full, d_theta_full, propensity_full, phi_full = model(
+            X_scaled_tensor, A_tensor, T_tensor
+        )
         ite_pred = model.compute_ite(X_scaled_tensor, A_tensor).cpu().numpy().flatten()
         fairness_penalty_full = pe_hat_full  # Use path-specific effect as fairness metric
     
@@ -262,21 +264,13 @@ def train_fair_cfrnet(X, T, Y, A, Y_cf=None, mu0=None, mu1=None, lambda_fairness
     }
     
     # Compute metrics using ground truth mu1 - mu0
+    # Always use mu1 - mu0 for IHDP dataset
     if mu0 is not None and mu1 is not None:
         # Use ground truth ITE: mu1 - mu0
         ite_true = mu1 - mu0
         pehe_val = pehe(ite_true, ite_pred)
-    elif Y_cf is not None:
-        # Fallback: Use Y_cf to calculate ITE
-        ite_true = np.zeros_like(Y)
-        treated_mask = T == 1
-        control_mask = T == 0
-        ite_true[treated_mask] = Y[treated_mask] - Y_cf[treated_mask]
-        ite_true[control_mask] = Y_cf[control_mask] - Y[control_mask]
-        pehe_val = pehe(ite_true, ite_pred)
     else:
-        ite_true = None
-        pehe_val = None
+        raise ValueError("IHDP dataset should have mu0 and mu1 for proper evaluation")
     
     if pehe_val is not None:
         results['pehe'] = pehe_val
@@ -297,11 +291,11 @@ def train_fair_cfrnet(X, T, Y, A, Y_cf=None, mu0=None, mu1=None, lambda_fairness
             batch_X = batch_X.to(device)
             batch_T = batch_T.to(device)
             batch_A = batch_A.to(device)
-            te, pe_hat, d_theta, propensity, phi = model(batch_X, batch_A, batch_T)
-            # Reconstruct y_pred from treatment effect
-            y_pred_t = model.t_head(phi)
+            te_unconstrained, te_fair, pe_hat, d_theta, propensity, phi = model(batch_X, batch_A, batch_T)
+            # Reconstruct y_pred from fair treatment effect
             y_pred_c = model.c_head(phi)
-            y_pred = torch.where(batch_T.unsqueeze(1) == 1, y_pred_t, y_pred_c)
+            y_pred_t_fair = y_pred_c + te_fair.unsqueeze(1)
+            y_pred = torch.where(batch_T.unsqueeze(1) == 1, y_pred_t_fair, y_pred_c)
             y_pred_val.append(y_pred.cpu().numpy())
     
     y_pred_val = np.concatenate(y_pred_val).flatten()

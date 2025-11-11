@@ -55,10 +55,10 @@ class FairCFRNet(nn.Module):
         self.beta_fairness = beta_fairness
         self.use_pmmd = use_pmmd
         
-        # Representation network: takes (X, A) as input
-        # +1 for sensitive attribute A
+        # Representation network: learns from X only (not A)
+        # Fairness adjustments are applied based on A separately
         self.representation = nn.Sequential(
-            nn.Linear(input_dim + 1, hidden_dim),
+            nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, hidden_dim),
@@ -70,8 +70,17 @@ class FairCFRNet(nn.Module):
         self.t_head = nn.Linear(hidden_dim, 1)  # Predicts Y(1)
         self.c_head = nn.Linear(hidden_dim, 1)   # Predicts Y(0)
         
-        # Propensity network: estimates P(T|X)
-        self.propensity_net = nn.Sequential(
+        # Propensity network for treatment: estimates P(T|X)
+        self.propensity_net_t = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, 1),
+            nn.Sigmoid()
+        )
+        
+        # Propensity network for sensitive attribute: estimates P(A=1|X)
+        self.propensity_net_a = nn.Sequential(
             nn.Linear(input_dim, hidden_dim // 2),
             nn.ReLU(),
             nn.Dropout(dropout),
@@ -86,6 +95,32 @@ class FairCFRNet(nn.Module):
             hidden_dims_mediator=[64],
             dropout=dropout
         )
+    
+    def compute_fair_predictions(self, te, pe_hat, d_theta):
+        """
+        Apply closed-form fair adjustment from Theorem 4.
+        
+        Parameters:
+        -----------
+        te : torch.Tensor
+            Unconstrained treatment effect estimates
+        pe_hat : torch.Tensor
+            Estimated path-specific effect PE(A -> Y)
+        d_theta : torch.Tensor
+            Canonical gradient [batch_size]
+        
+        Returns:
+        --------
+        te_fair : torch.Tensor
+            Fairness-adjusted treatment effect
+        """
+        # Compute variance of gradient
+        sigma2 = torch.var(d_theta)
+        
+        # Closed-form adjustment (Eq. 6 from paper)
+        te_fair = te.squeeze() - (pe_hat * d_theta) / (sigma2 + 1e-6)
+        
+        return te_fair
     
     def forward(self, x, a, t):
         """
@@ -102,8 +137,10 @@ class FairCFRNet(nn.Module):
         
         Returns:
         --------
-        te : torch.Tensor
-            Treatment effect estimates [batch_size, 1]
+        te_unconstrained : torch.Tensor
+            Unconstrained treatment effect estimates [batch_size, 1]
+        te_fair : torch.Tensor
+            Fairness-adjusted treatment effect [batch_size]
         pe_hat : torch.Tensor
             Estimated path-specific effect PE(A -> Y) (scalar)
         d_theta : torch.Tensor
@@ -113,27 +150,32 @@ class FairCFRNet(nn.Module):
         phi : torch.Tensor
             Learned representations [batch_size, hidden_dim]
         """
-        # Concatenate sensitive attribute for base prediction
-        inputs = torch.cat([x, a.unsqueeze(1)], dim=1)
-        phi = self.representation(inputs)
+        # Representation learns from X only (not A)
+        phi = self.representation(x)
         
         # Unconstrained predictions
         y_hat_t = self.t_head(phi)  # Y(1)
         y_hat_c = self.c_head(phi)   # Y(0)
         
         # Unconstrained treatment effect
-        te = y_hat_t - y_hat_c
+        te_unconstrained = y_hat_t - y_hat_c
         
         # Fairness components (calculated separately)
-        propensity = self.propensity_net(x)  # P(T|X)
+        propensity = self.propensity_net_t(x)  # P(T|X)
         
         # Get path-specific effect and mediator probabilities from DCE module
-        pe_hat, d_theta_mediator_comp, p_m_given_x_a, p_m_given_x_a0 = self.dce_module(x, a, t, te)
+        # Pass propensity_net_a for P(A=1|X)
+        pe_hat, d_theta_mediator_comp, p_m_given_x_a, p_m_given_x_a0 = self.dce_module(
+            x, a, t, te_unconstrained, self.propensity_net_a
+        )
         
         # Compute full canonical gradient d_theta
-        d_theta = compute_d_theta(x, a, p_m_given_x_a, p_m_given_x_a0, self.propensity_net)
+        d_theta = compute_d_theta(x, a, p_m_given_x_a, p_m_given_x_a0, self.propensity_net_a)
         
-        return te, pe_hat, d_theta, propensity, phi
+        # Apply closed-form fair adjustment
+        te_fair = self.compute_fair_predictions(te_unconstrained, pe_hat, d_theta)
+        
+        return te_unconstrained, te_fair, pe_hat, d_theta, propensity, phi
     
     def compute_ipm_loss(self, phi_t0, phi_t1):
         """
@@ -206,14 +248,16 @@ class FairCFRNet(nn.Module):
         mean_y = y.mean(dim=0)
         return torch.norm(mean_x - mean_y, p=2)
     
-    def compute_loss(self, te, y_true, t, phi, pe_hat, d_theta, ipm_loss):
+    def compute_loss(self, te_unconstrained, te_fair, y_true, t, phi, pe_hat, ipm_loss):
         """
-        Compute the total loss for FairCFRNet.
+        Loss based on fair predictions, with constraint penalty.
         
         Parameters:
         -----------
-        te : torch.Tensor
-            Treatment effect estimates
+        te_unconstrained : torch.Tensor
+            Unconstrained treatment effect estimates
+        te_fair : torch.Tensor
+            Fairness-adjusted treatment effect
         y_true : torch.Tensor
             True outcomes
         t : torch.Tensor
@@ -222,66 +266,40 @@ class FairCFRNet(nn.Module):
             Learned representations
         pe_hat : torch.Tensor
             Estimated path-specific effect
-        d_theta : torch.Tensor
-            Canonical gradient
         ipm_loss : torch.Tensor
             IPM loss value
         
         Returns:
         --------
         total_loss : torch.Tensor
-            Total loss = pred_loss + alpha * ipm_loss + lambda * L_fair
+            Total loss = pred_loss + alpha * ipm_loss + lambda * constraint_loss
         pred_loss : torch.Tensor
-            Prediction loss
+            Prediction loss using fair predictions
         ipm_loss_val : torch.Tensor
             IPM loss value
-        fairness_loss : torch.Tensor
-            Fairness loss value
+        constraint_loss : torch.Tensor
+            Constraint penalty (should be small after adjustment)
         """
-        # Prediction loss: predict observed outcomes
-        # We need to reconstruct y_pred from te and t
-        # y_pred = t * y1 + (1-t) * y0
-        # But we have te = y1 - y0, so we need y0 and y1 separately
-        # For now, use a simplified prediction loss based on treatment effect
-        # In practice, you'd want to predict y0 and y1 separately
+        # Prediction loss using FAIR predictions
+        # Reconstruct Y(0) and Y(1) from fair treatment effect
+        y_pred_c = self.c_head(phi)  # Y(0)
+        y_pred_t_fair = y_pred_c + te_fair.unsqueeze(1)  # Y(1) = Y(0) + TE_fair
+        y_pred_fair = torch.where(t.unsqueeze(1) == 1, y_pred_t_fair, y_pred_c)
         
-        # Simplified: use MSE on treatment effect if we have ground truth ITE
-        # Otherwise, use outcome prediction
-        # For this implementation, we'll compute prediction loss on outcomes
-        # reconstructed from treatment effects
+        pred_loss = F.mse_loss(y_pred_fair, y_true.unsqueeze(1))
         
-        # Get predictions for observed treatment
-        y_pred_t = self.t_head(phi)
-        y_pred_c = self.c_head(phi)
-        y_pred = torch.where(t.unsqueeze(1) == 1, y_pred_t, y_pred_c)
-        
-        pred_loss = F.mse_loss(y_pred, y_true.unsqueeze(1))
-        
-        # Fairness loss: L_fair = |PE(A -> Y)| + beta * adjustment_term
-        # Adjustment term: variance of d_theta weighted by treatment effect
-        sigma2 = torch.var(d_theta)
-        
-        # Fairness-adjusted treatment effect (closed-form adjustment)
-        # TE* = TE - (PE * d_theta) / (sigma2 + eps)
-        te_adj = te.squeeze() - (pe_hat * d_theta) / (sigma2 + 1e-6)
-        
-        # Constraint loss: minimize path-specific effect
+        # Constraint penalty (should be small after adjustment)
         constraint_loss = torch.abs(pe_hat)
         
-        # Adjustment loss: minimize difference between TE and TE*
-        adjustment_loss = torch.mean((te.squeeze() - te_adj) ** 2)
-        
-        # Total fairness loss
-        fairness_loss = constraint_loss + self.beta_fairness * adjustment_loss
-        
         # Total loss
-        total_loss = pred_loss + self.alpha * ipm_loss + self.lambda_fairness * fairness_loss
+        total_loss = pred_loss + self.alpha * ipm_loss + self.lambda_fairness * constraint_loss
         
-        return total_loss, pred_loss, ipm_loss, fairness_loss
+        return total_loss, pred_loss, ipm_loss, constraint_loss
     
     def compute_ite(self, x, a):
         """
         Compute Individual Treatment Effect (ITE) for given inputs.
+        Returns the fair-adjusted treatment effect.
         
         Parameters:
         -----------
@@ -293,17 +311,28 @@ class FairCFRNet(nn.Module):
         Returns:
         --------
         ite : torch.Tensor
-            Individual Treatment Effects
+            Fairness-adjusted Individual Treatment Effects
         """
-        # Concatenate sensitive attribute
-        inputs = torch.cat([x, a.unsqueeze(1)], dim=1)
-        phi = self.representation(inputs)
+        # Representation learns from X only
+        phi = self.representation(x)
         
-        # Get predictions
+        # Get unconstrained predictions
         y_hat_t = self.t_head(phi)
         y_hat_c = self.c_head(phi)
+        te_unconstrained = y_hat_t - y_hat_c
         
-        # Treatment effect
-        ite = y_hat_t - y_hat_c
-        return ite
+        # For ITE computation, we need to compute fairness components
+        # Create dummy treatment indicator (not used for ITE, but needed for DCE)
+        t_dummy = torch.zeros_like(a)
+        
+        # Get path-specific effect and compute fair adjustment
+        pe_hat, _, p_m_given_x_a, p_m_given_x_a0 = self.dce_module(
+            x, a, t_dummy, te_unconstrained, self.propensity_net_a
+        )
+        d_theta = compute_d_theta(x, a, p_m_given_x_a, p_m_given_x_a0, self.propensity_net_a)
+        
+        # Apply fair adjustment
+        te_fair = self.compute_fair_predictions(te_unconstrained, pe_hat, d_theta)
+        
+        return te_fair.unsqueeze(1)
 
