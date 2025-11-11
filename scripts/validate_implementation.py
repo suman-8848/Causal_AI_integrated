@@ -194,7 +194,7 @@ def check_5_gradient_flow():
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
     
     optimizer.zero_grad()
-    y_pred, phi, fairness_penalty = model(X, A, T)
+    te_unconstrained, te_fair, pe_hat, d_theta, propensity, phi, y_pred = model(X, A, T)
     
     # Compute IPM loss
     treated_mask = T == 1
@@ -203,24 +203,28 @@ def check_5_gradient_flow():
     if treated_mask.sum() > 0 and control_mask.sum() > 0:
         phi_t1 = phi[treated_mask]
         phi_t0 = phi[control_mask]
-        ipm_loss = model.cfr_net.compute_ipm_loss(phi_t0, phi_t1)
+        ipm_loss = model.compute_ipm_loss(phi_t0, phi_t1)
     else:
         ipm_loss = torch.tensor(0.0)
     
-    total_loss, pred_loss, ipm_loss_val, fairness_penalty_val = model.compute_loss(
-        y_pred, Y, phi, T, ipm_loss, fairness_penalty
+    total_loss, pred_loss, ipm_loss_val, constraint_loss_val = model.compute_loss(
+        te_unconstrained, te_fair, Y, T, phi, pe_hat, ipm_loss, y_pred
     )
     
     total_loss.backward()
     
     print("\n--- Gradient Check ---")
-    main_model_params = dict(model.cfr_net.named_parameters())
+    # Get parameters from the actual architecture
+    representation_params = dict(model.representation.named_parameters())
+    outcome_params = {**dict(model.t_head.named_parameters()), 
+                      **dict(model.c_head.named_parameters()),
+                      **dict(model.outcome_net.named_parameters())}
     dce_params = dict(model.dce_module.named_parameters())
     
     has_gradients_main = False
     has_gradients_dce = False
     
-    for name, param in list(main_model_params.items())[:5]:  # Check first 5 params
+    for name, param in list(representation_params.items())[:5]:  # Check first 5 params
         if param.grad is not None:
             print(f"Gradient for {name}: {param.grad.norm():.4f}")
             has_gradients_main = True
@@ -271,7 +275,7 @@ def check_6_loss_components():
     if treated_mask.sum() > 0 and control_mask.sum() > 0:
         phi_t1 = phi[treated_mask]
         phi_t0 = phi[control_mask]
-        ipm_loss = model.cfr_net.compute_ipm_loss(phi_t0, phi_t1)
+        ipm_loss = model.compute_ipm_loss(phi_t0, phi_t1)
     else:
         ipm_loss = torch.tensor(0.0)
     
@@ -327,7 +331,7 @@ def check_7_lambda_hyperparameter():
         if treated_mask.sum() > 0 and control_mask.sum() > 0:
             phi_t1 = phi[treated_mask]
             phi_t0 = phi[control_mask]
-            ipm_loss = model.cfr_net.compute_ipm_loss(phi_t0, phi_t1)
+            ipm_loss = model.compute_ipm_loss(phi_t0, phi_t1)
         else:
             ipm_loss = torch.tensor(0.0)
         

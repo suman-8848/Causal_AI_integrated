@@ -142,8 +142,8 @@ def train_fair_cfrnet(X, T, Y, A, Y_cf=None, mu0=None, mu1=None, lambda_fairness
             
             optimizer.zero_grad()
             
-            # Forward pass - returns te_unconstrained, te_fair, pe_hat, d_theta, propensity, phi
-            te_unconstrained, te_fair, pe_hat, d_theta, propensity, phi = model(batch_X, batch_A, batch_T)
+            # Forward pass - returns te_unconstrained, te_fair, pe_hat, d_theta, propensity, phi, y_pred
+            te_unconstrained, te_fair, pe_hat, d_theta, propensity, phi, y_pred = model(batch_X, batch_A, batch_T)
             
             # Separate treated and control for IPM
             treated_mask = batch_T == 1
@@ -156,9 +156,9 @@ def train_fair_cfrnet(X, T, Y, A, Y_cf=None, mu0=None, mu1=None, lambda_fairness
             else:
                 ipm_loss = torch.tensor(0.0, device=device)
             
-            # Compute total loss (uses fair predictions)
+            # Compute total loss (uses outcomes with mediator)
             total_loss, pred_loss, ipm_loss_val, constraint_loss_val = model.compute_loss(
-                te_unconstrained, te_fair, batch_Y, batch_T, phi, pe_hat, ipm_loss
+                te_unconstrained, te_fair, batch_Y, batch_T, phi, pe_hat, ipm_loss, y_pred
             )
             
             # Backward pass
@@ -184,7 +184,7 @@ def train_fair_cfrnet(X, T, Y, A, Y_cf=None, mu0=None, mu1=None, lambda_fairness
                 batch_Y = batch_Y.to(device)
                 batch_A = batch_A.to(device)
                 
-                te_unconstrained, te_fair, pe_hat, d_theta, propensity, phi = model(batch_X, batch_A, batch_T)
+                te_unconstrained, te_fair, pe_hat, d_theta, propensity, phi, y_pred = model(batch_X, batch_A, batch_T)
                 
                 # Separate treated and control
                 treated_mask = batch_T == 1
@@ -198,7 +198,7 @@ def train_fair_cfrnet(X, T, Y, A, Y_cf=None, mu0=None, mu1=None, lambda_fairness
                     ipm_loss = torch.tensor(0.0, device=device)
                 
                 total_loss, pred_loss, ipm_loss_val, constraint_loss_val = model.compute_loss(
-                    te_unconstrained, te_fair, batch_Y, batch_T, phi, pe_hat, ipm_loss
+                    te_unconstrained, te_fair, batch_Y, batch_T, phi, pe_hat, ipm_loss, y_pred
                 )
                 
                 val_loss += total_loss.item()
@@ -245,7 +245,7 @@ def train_fair_cfrnet(X, T, Y, A, Y_cf=None, mu0=None, mu1=None, lambda_fairness
     T_tensor = torch.FloatTensor(T).to(device)
     
     with torch.no_grad():
-        te_unconstrained_full, te_fair_full, pe_hat_full, d_theta_full, propensity_full, phi_full = model(
+        te_unconstrained_full, te_fair_full, pe_hat_full, d_theta_full, propensity_full, phi_full, y_pred_full = model(
             X_scaled_tensor, A_tensor, T_tensor
         )
         ite_pred = model.compute_ite(X_scaled_tensor, A_tensor).cpu().numpy().flatten()
@@ -291,11 +291,8 @@ def train_fair_cfrnet(X, T, Y, A, Y_cf=None, mu0=None, mu1=None, lambda_fairness
             batch_X = batch_X.to(device)
             batch_T = batch_T.to(device)
             batch_A = batch_A.to(device)
-            te_unconstrained, te_fair, pe_hat, d_theta, propensity, phi = model(batch_X, batch_A, batch_T)
-            # Reconstruct y_pred from fair treatment effect
-            y_pred_c = model.c_head(phi)
-            y_pred_t_fair = y_pred_c + te_fair.unsqueeze(1)
-            y_pred = torch.where(batch_T.unsqueeze(1) == 1, y_pred_t_fair, y_pred_c)
+            te_unconstrained, te_fair, pe_hat, d_theta, propensity, phi, y_pred = model(batch_X, batch_A, batch_T)
+            # y_pred already uses mediator in outcome network
             y_pred_val.append(y_pred.cpu().numpy())
     
     y_pred_val = np.concatenate(y_pred_val).flatten()

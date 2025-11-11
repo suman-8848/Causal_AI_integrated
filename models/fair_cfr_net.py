@@ -66,9 +66,22 @@ class FairCFRNet(nn.Module):
             nn.Dropout(dropout)
         )
         
-        # Treatment heads: predict Y(1) and Y(0) from representation
+        # Treatment heads: predict Y(1) and Y(0) from representation (legacy, kept for compatibility)
         self.t_head = nn.Linear(hidden_dim, 1)  # Predicts Y(1)
         self.c_head = nn.Linear(hidden_dim, 1)   # Predicts Y(0)
+        
+        # Outcome network: takes (X, M, A) as input to model A -> M -> Y path
+        # This explicitly models the causal path through mediators
+        outcome_input_dim = input_dim + m_dim + 1  # X + M + A
+        self.outcome_net = nn.Sequential(
+            nn.Linear(outcome_input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, 1)
+        )
         
         # Propensity network for treatment: estimates P(T|X)
         self.propensity_net_t = nn.Sequential(
@@ -125,6 +138,7 @@ class FairCFRNet(nn.Module):
     def forward(self, x, a, t):
         """
         Forward pass through FairCFRNet.
+        Models the causal path A -> M -> Y explicitly.
         
         Parameters:
         -----------
@@ -149,24 +163,45 @@ class FairCFRNet(nn.Module):
             Propensity scores P(T|X) [batch_size, 1]
         phi : torch.Tensor
             Learned representations [batch_size, hidden_dim]
+        y_pred : torch.Tensor
+            Predicted outcomes using mediator [batch_size, 1]
         """
         # Representation learns from X only (not A)
         phi = self.representation(x)
         
-        # Unconstrained predictions
-        y_hat_t = self.t_head(phi)  # Y(1)
-        y_hat_c = self.c_head(phi)   # Y(0)
+        # Get mediator for observed A: M(A)
+        m_obs = self.dce_module.get_mediator_predictions(x, a)
         
-        # Unconstrained treatment effect
-        te_unconstrained = y_hat_t - y_hat_c
+        # For path-specific effect: use counterfactual mediator M(A=0)
+        # This blocks the direct path A -> Y, only allowing A -> M -> Y
+        m_a0 = self.dce_module.get_mediator_predictions(x, torch.zeros_like(a))
+        
+        # Predict Y(1) using counterfactual mediator M(A=0) and A=1
+        # Y(1, M(0)): outcome when A=1 but M behaves as if A=0
+        a_1 = torch.ones_like(a)
+        input_y1 = torch.cat([x, m_a0, a_1.unsqueeze(1)], dim=1)
+        y1_pred = self.outcome_net(input_y1)
+        
+        # Predict Y(0) using counterfactual mediator M(A=0) and A=0
+        # Y(0, M(0)): outcome when A=0 and M behaves as if A=0
+        a_0 = torch.zeros_like(a)
+        input_y0 = torch.cat([x, m_a0, a_0.unsqueeze(1)], dim=1)
+        y0_pred = self.outcome_net(input_y0)
+        
+        # Unconstrained treatment effect (using mediator)
+        te_unconstrained = y1_pred - y0_pred
+        
+        # Predict observed outcome using actual mediator M(A)
+        input_y_obs = torch.cat([x, m_obs, a.unsqueeze(1)], dim=1)
+        y_pred = self.outcome_net(input_y_obs)
         
         # Fairness components (calculated separately)
         propensity = self.propensity_net_t(x)  # P(T|X)
         
         # Get path-specific effect and mediator probabilities from DCE module
-        # Pass propensity_net_a for P(A=1|X)
+        # Pass actual outcomes y_pred for AIPW estimator
         pe_hat, d_theta_mediator_comp, p_m_given_x_a, p_m_given_x_a0 = self.dce_module(
-            x, a, t, te_unconstrained, self.propensity_net_a
+            x, a, t, y_pred, self.propensity_net_a
         )
         
         # Compute full canonical gradient d_theta
@@ -175,7 +210,7 @@ class FairCFRNet(nn.Module):
         # Apply closed-form fair adjustment
         te_fair = self.compute_fair_predictions(te_unconstrained, pe_hat, d_theta)
         
-        return te_unconstrained, te_fair, pe_hat, d_theta, propensity, phi
+        return te_unconstrained, te_fair, pe_hat, d_theta, propensity, phi, y_pred
     
     def compute_ipm_loss(self, phi_t0, phi_t1):
         """
@@ -248,7 +283,7 @@ class FairCFRNet(nn.Module):
         mean_y = y.mean(dim=0)
         return torch.norm(mean_x - mean_y, p=2)
     
-    def compute_loss(self, te_unconstrained, te_fair, y_true, t, phi, pe_hat, ipm_loss):
+    def compute_loss(self, te_unconstrained, te_fair, y_true, t, phi, pe_hat, ipm_loss, y_pred):
         """
         Loss based on fair predictions, with constraint penalty.
         
@@ -268,25 +303,23 @@ class FairCFRNet(nn.Module):
             Estimated path-specific effect
         ipm_loss : torch.Tensor
             IPM loss value
+        y_pred : torch.Tensor
+            Predicted outcomes using mediator
         
         Returns:
         --------
         total_loss : torch.Tensor
             Total loss = pred_loss + alpha * ipm_loss + lambda * constraint_loss
         pred_loss : torch.Tensor
-            Prediction loss using fair predictions
+            Prediction loss using outcomes with mediator
         ipm_loss_val : torch.Tensor
             IPM loss value
         constraint_loss : torch.Tensor
             Constraint penalty (should be small after adjustment)
         """
-        # Prediction loss using FAIR predictions
-        # Reconstruct Y(0) and Y(1) from fair treatment effect
-        y_pred_c = self.c_head(phi)  # Y(0)
-        y_pred_t_fair = y_pred_c + te_fair.unsqueeze(1)  # Y(1) = Y(0) + TE_fair
-        y_pred_fair = torch.where(t.unsqueeze(1) == 1, y_pred_t_fair, y_pred_c)
-        
-        pred_loss = F.mse_loss(y_pred_fair, y_true.unsqueeze(1))
+        # Prediction loss using outcomes with mediator
+        # y_pred already uses the mediator M in the outcome network
+        pred_loss = F.mse_loss(y_pred, y_true.unsqueeze(1))
         
         # Constraint penalty (should be small after adjustment)
         constraint_loss = torch.abs(pe_hat)
@@ -299,7 +332,7 @@ class FairCFRNet(nn.Module):
     def compute_ite(self, x, a):
         """
         Compute Individual Treatment Effect (ITE) for given inputs.
-        Returns the fair-adjusted treatment effect.
+        Returns the fair-adjusted treatment effect using mediators.
         
         Parameters:
         -----------
@@ -313,21 +346,33 @@ class FairCFRNet(nn.Module):
         ite : torch.Tensor
             Fairness-adjusted Individual Treatment Effects
         """
-        # Representation learns from X only
-        phi = self.representation(x)
+        # Get counterfactual mediator M(A=0)
+        m_a0 = self.dce_module.get_mediator_predictions(x, torch.zeros_like(a))
         
-        # Get unconstrained predictions
-        y_hat_t = self.t_head(phi)
-        y_hat_c = self.c_head(phi)
-        te_unconstrained = y_hat_t - y_hat_c
+        # Predict Y(1) and Y(0) using counterfactual mediator
+        a_1 = torch.ones_like(a)
+        a_0 = torch.zeros_like(a)
+        
+        input_y1 = torch.cat([x, m_a0, a_1.unsqueeze(1)], dim=1)
+        y1_pred = self.outcome_net(input_y1)
+        
+        input_y0 = torch.cat([x, m_a0, a_0.unsqueeze(1)], dim=1)
+        y0_pred = self.outcome_net(input_y0)
+        
+        te_unconstrained = y1_pred - y0_pred
         
         # For ITE computation, we need to compute fairness components
+        # Use predicted outcome with actual mediator for AIPW
+        m_obs = self.dce_module.get_mediator_predictions(x, a)
+        input_y_obs = torch.cat([x, m_obs, a.unsqueeze(1)], dim=1)
+        y_pred = self.outcome_net(input_y_obs)
+        
         # Create dummy treatment indicator (not used for ITE, but needed for DCE)
         t_dummy = torch.zeros_like(a)
         
         # Get path-specific effect and compute fair adjustment
         pe_hat, _, p_m_given_x_a, p_m_given_x_a0 = self.dce_module(
-            x, a, t_dummy, te_unconstrained, self.propensity_net_a
+            x, a, t_dummy, y_pred, self.propensity_net_a
         )
         d_theta = compute_d_theta(x, a, p_m_given_x_a, p_m_given_x_a0, self.propensity_net_a)
         
