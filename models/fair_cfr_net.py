@@ -70,9 +70,10 @@ class FairCFRNet(nn.Module):
         self.t_head = nn.Linear(hidden_dim, 1)  # Predicts Y(1)
         self.c_head = nn.Linear(hidden_dim, 1)   # Predicts Y(0)
         
-        # Outcome network: takes (X, M, A) as input to model A -> M -> Y path
-        # This explicitly models the causal path through mediators
-        outcome_input_dim = input_dim + m_dim + 1  # X + M + A
+        # Outcome network: takes (X, M, T) as input to model T -> Y path
+        # M is used to block A -> Y path (by using M(A=0) counterfactual)
+        # T is the treatment indicator for predicting Y(1) vs Y(0)
+        outcome_input_dim = input_dim + m_dim + 1  # X + M + T
         self.outcome_net = nn.Sequential(
             nn.Linear(outcome_input_dim, hidden_dim),
             nn.ReLU(),
@@ -130,8 +131,21 @@ class FairCFRNet(nn.Module):
         # Compute variance of gradient
         sigma2 = torch.var(d_theta)
         
+        # Add minimum threshold to prevent division by very small values
+        # This prevents the adjustment from being too aggressive
+        sigma2 = torch.clamp(sigma2, min=1e-4)
+        
         # Closed-form adjustment (Eq. 6 from paper)
-        te_fair = te.squeeze() - (pe_hat * d_theta) / (sigma2 + 1e-6)
+        # Adjust by the path-specific effect weighted by canonical gradient
+        adjustment = (pe_hat * d_theta) / sigma2
+        
+        # Clip adjustment to prevent extreme values (safeguard)
+        # Limit adjustment to at most 50% of the unconstrained TE magnitude
+        te_magnitude = torch.abs(te.squeeze())
+        max_adjustment = 0.5 * te_magnitude
+        adjustment = torch.clamp(adjustment, min=-max_adjustment, max=max_adjustment)
+        
+        te_fair = te.squeeze() - adjustment
         
         return te_fair
     
@@ -176,23 +190,23 @@ class FairCFRNet(nn.Module):
         # This blocks the direct path A -> Y, only allowing A -> M -> Y
         m_a0 = self.dce_module.get_mediator_predictions(x, torch.zeros_like(a))
         
-        # Predict Y(1) using counterfactual mediator M(A=0) and A=1
-        # Y(1, M(0)): outcome when A=1 but M behaves as if A=0
-        a_1 = torch.ones_like(a)
-        input_y1 = torch.cat([x, m_a0, a_1.unsqueeze(1)], dim=1)
+        # Predict Y(1) using counterfactual mediator M(A=0) and T=1
+        # Y(1, M(0)): outcome when T=1 but M behaves as if A=0 (blocks A->Y path)
+        t_1 = torch.ones_like(t)
+        input_y1 = torch.cat([x, m_a0, t_1.unsqueeze(1)], dim=1)
         y1_pred = self.outcome_net(input_y1)
         
-        # Predict Y(0) using counterfactual mediator M(A=0) and A=0
-        # Y(0, M(0)): outcome when A=0 and M behaves as if A=0
-        a_0 = torch.zeros_like(a)
-        input_y0 = torch.cat([x, m_a0, a_0.unsqueeze(1)], dim=1)
+        # Predict Y(0) using counterfactual mediator M(A=0) and T=0
+        # Y(0, M(0)): outcome when T=0 and M behaves as if A=0 (blocks A->Y path)
+        t_0 = torch.zeros_like(t)
+        input_y0 = torch.cat([x, m_a0, t_0.unsqueeze(1)], dim=1)
         y0_pred = self.outcome_net(input_y0)
         
-        # Unconstrained treatment effect (using mediator)
+        # Unconstrained treatment effect (using mediator to block A->Y path)
         te_unconstrained = y1_pred - y0_pred
         
-        # Predict observed outcome using actual mediator M(A)
-        input_y_obs = torch.cat([x, m_obs, a.unsqueeze(1)], dim=1)
+        # Predict observed outcome using actual mediator M(A) and observed treatment T
+        input_y_obs = torch.cat([x, m_obs, t.unsqueeze(1)], dim=1)
         y_pred = self.outcome_net(input_y_obs)
         
         # Fairness components (calculated separately)
@@ -346,25 +360,30 @@ class FairCFRNet(nn.Module):
         ite : torch.Tensor
             Fairness-adjusted Individual Treatment Effects
         """
-        # Get counterfactual mediator M(A=0)
+        # Get counterfactual mediator M(A=0) to block A->Y path
         m_a0 = self.dce_module.get_mediator_predictions(x, torch.zeros_like(a))
         
-        # Predict Y(1) and Y(0) using counterfactual mediator
-        a_1 = torch.ones_like(a)
-        a_0 = torch.zeros_like(a)
+        # Predict Y(1) and Y(0) using counterfactual mediator and treatment T
+        # Use T=1 for Y(1) and T=0 for Y(0)
+        batch_size = x.shape[0]
+        t_1 = torch.ones(batch_size, device=x.device)
+        t_0 = torch.zeros(batch_size, device=x.device)
         
-        input_y1 = torch.cat([x, m_a0, a_1.unsqueeze(1)], dim=1)
+        input_y1 = torch.cat([x, m_a0, t_1.unsqueeze(1)], dim=1)
         y1_pred = self.outcome_net(input_y1)
         
-        input_y0 = torch.cat([x, m_a0, a_0.unsqueeze(1)], dim=1)
+        input_y0 = torch.cat([x, m_a0, t_0.unsqueeze(1)], dim=1)
         y0_pred = self.outcome_net(input_y0)
         
         te_unconstrained = y1_pred - y0_pred
         
         # For ITE computation, we need to compute fairness components
-        # Use predicted outcome with actual mediator for AIPW
+        # Use predicted outcome with actual mediator M(A) and average treatment for AIPW
         m_obs = self.dce_module.get_mediator_predictions(x, a)
-        input_y_obs = torch.cat([x, m_obs, a.unsqueeze(1)], dim=1)
+        # Use T=0.5 as average for computing fairness (or use actual T if available)
+        # For now, use T=0.5 to get average outcome
+        t_avg = torch.ones(batch_size, device=x.device) * 0.5
+        input_y_obs = torch.cat([x, m_obs, t_avg.unsqueeze(1)], dim=1)
         y_pred = self.outcome_net(input_y_obs)
         
         # Create dummy treatment indicator (not used for ITE, but needed for DCE)
@@ -380,4 +399,39 @@ class FairCFRNet(nn.Module):
         te_fair = self.compute_fair_predictions(te_unconstrained, pe_hat, d_theta)
         
         return te_fair.unsqueeze(1)
+    
+    def compute_ite_unconstrained(self, x, a):
+        """
+        Compute unconstrained Individual Treatment Effect (ITE) without fairness adjustment.
+        Useful for debugging and comparison.
+        
+        Parameters:
+        -----------
+        x : torch.Tensor
+            Covariates
+        a : torch.Tensor
+            Sensitive attribute
+        
+        Returns:
+        --------
+        ite : torch.Tensor
+            Unconstrained Individual Treatment Effects
+        """
+        # Get counterfactual mediator M(A=0) to block A->Y path
+        m_a0 = self.dce_module.get_mediator_predictions(x, torch.zeros_like(a))
+        
+        # Predict Y(1) and Y(0) using counterfactual mediator and treatment T
+        batch_size = x.shape[0]
+        t_1 = torch.ones(batch_size, device=x.device)
+        t_0 = torch.zeros(batch_size, device=x.device)
+        
+        input_y1 = torch.cat([x, m_a0, t_1.unsqueeze(1)], dim=1)
+        y1_pred = self.outcome_net(input_y1)
+        
+        input_y0 = torch.cat([x, m_a0, t_0.unsqueeze(1)], dim=1)
+        y0_pred = self.outcome_net(input_y0)
+        
+        te_unconstrained = y1_pred - y0_pred
+        
+        return te_unconstrained
 
