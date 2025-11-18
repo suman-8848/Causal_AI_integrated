@@ -13,7 +13,9 @@ import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from utils.data_loader import load_ihdp_data, preprocess_ihdp_data
-from utils.metrics import pehe, compute_ite, demographic_parity_gap, compute_ate_error
+from utils.metrics import (pehe, compute_ite, demographic_parity_gap_regression, 
+                          compute_ate_error, measure_direct_effect, 
+                          measure_counterfactual_fairness, measure_equalized_odds)
 from models.cfr_net import CFRNet
 from models.fair_cfr_net import FairCFRNet
 from sklearn.preprocessing import StandardScaler
@@ -252,7 +254,7 @@ def evaluate_model(model, X, T, Y, Y_cf, mu0, mu1, A, scaler, model_type='baseli
             y_pred, _, _ = model(X_tensor, A_tensor, T_tensor)
         y_pred = y_pred.cpu().numpy().flatten()
     
-    dp_gap = demographic_parity_gap(y_pred, A)
+    dp_gap = demographic_parity_gap_regression(y_pred, A)
     
     # Compute PE(A -> Y) from DCE module if available
     fairness_penalty = None
@@ -263,6 +265,20 @@ def evaluate_model(model, X, T, Y, Y_cf, mu0, mu1, A, scaler, model_type='baseli
             T_tensor_cpu = T_tensor.to(device)
             fairness_penalty = model.dce_module(X_tensor_cpu, A_tensor_cpu, T_tensor_cpu).item()
     
+    # New fairness metrics
+    direct_effect = measure_direct_effect(model, X_scaled, A, device=device)
+    
+    # For counterfactual fairness, we need mediator predictions
+    counterfactual_fairness = None
+    if model_type == 'fair' and hasattr(model, 'dce_module'):
+        with torch.no_grad():
+            # Get mediator predictions for observed A
+            m_obs = model.dce_module.get_mediator_predictions(X_tensor, A_tensor).cpu().numpy()
+            counterfactual_fairness = measure_counterfactual_fairness(model, X_scaled, A, m_obs, device=device)
+    
+    # Equalized odds
+    equalized_odds = measure_equalized_odds(y_pred, Y, A, T)
+    
     results = {
         'pehe': pehe_val,
         'ate_error': ate_error,
@@ -270,6 +286,9 @@ def evaluate_model(model, X, T, Y, Y_cf, mu0, mu1, A, scaler, model_type='baseli
         'ate_pred': ate_pred,
         'demographic_parity_gap': dp_gap,
         'fairness_penalty': fairness_penalty,
+        'direct_effect': direct_effect,
+        'counterfactual_fairness': counterfactual_fairness,
+        'equalized_odds': equalized_odds,
         'ite_pred': ite_pred,
         'ite_true': ite_true,
     }
@@ -296,6 +315,7 @@ def create_tradeoff_plot(results_dict, save_path='results/fairness_accuracy_trad
     pehe_values = []
     fairness_penalties = []
     dp_gaps = []
+    direct_effects = []
     
     for lambda_val in sorted(results_dict.keys()):
         res = results_dict[lambda_val]
@@ -304,11 +324,12 @@ def create_tradeoff_plot(results_dict, save_path='results/fairness_accuracy_trad
             pehe_values.append(res['pehe'])
             fairness_penalties.append(res.get('fairness_penalty', 0))
             dp_gaps.append(res.get('demographic_parity_gap', 0))
+            direct_effects.append(res.get('direct_effect', 0))
     
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     
     # Plot 1: PEHE vs Fairness Penalty (PE(A -> Y))
-    ax1 = axes[0]
+    ax1 = axes[0, 0]
     ax1.plot(fairness_penalties, pehe_values, 'o-', linewidth=2, markersize=8)
     for i, lambda_val in enumerate(lambdas):
         ax1.annotate(f'λ={lambda_val}', 
@@ -320,7 +341,7 @@ def create_tradeoff_plot(results_dict, save_path='results/fairness_accuracy_trad
     ax1.grid(True, alpha=0.3)
     
     # Plot 2: PEHE vs Demographic Parity Gap
-    ax2 = axes[1]
+    ax2 = axes[0, 1]
     ax2.plot(dp_gaps, pehe_values, 's-', linewidth=2, markersize=8, color='green')
     for i, lambda_val in enumerate(lambdas):
         ax2.annotate(f'λ={lambda_val}', 
@@ -330,6 +351,35 @@ def create_tradeoff_plot(results_dict, save_path='results/fairness_accuracy_trad
     ax2.set_ylabel('PEHE', fontsize=12)
     ax2.set_title('Fairness-Accuracy Trade-off\n(Demographic Parity vs PEHE)', fontsize=14)
     ax2.grid(True, alpha=0.3)
+    
+    # Plot 3: PEHE vs Direct Effect
+    ax3 = axes[1, 0]
+    ax3.plot(direct_effects, pehe_values, '^-', linewidth=2, markersize=8, color='red')
+    for i, lambda_val in enumerate(lambdas):
+        ax3.annotate(f'λ={lambda_val}', 
+                    (direct_effects[i], pehe_values[i]),
+                    textcoords="offset points", xytext=(0,10), ha='center')
+    ax3.set_xlabel('Direct Effect (PE(A → Ŷ))', fontsize=12)
+    ax3.set_ylabel('PEHE', fontsize=12)
+    ax3.set_title('Fairness-Accuracy Trade-off\n(Direct Effect vs PEHE)', fontsize=14)
+    ax3.grid(True, alpha=0.3)
+    
+    # Plot 4: Fairness metrics comparison
+    ax4 = axes[1, 1]
+    width = 0.2
+    x = np.arange(len(lambdas))
+    
+    ax4.bar(x - width, fairness_penalties, width, label='Fairness Penalty')
+    ax4.bar(x, dp_gaps, width, label='Demographic Parity')
+    ax4.bar(x + width, direct_effects, width, label='Direct Effect')
+    
+    ax4.set_xlabel('Lambda Value', fontsize=12)
+    ax4.set_ylabel('Fairness Metric Value', fontsize=12)
+    ax4.set_title('Comparison of Fairness Metrics', fontsize=14)
+    ax4.set_xticks(x)
+    ax4.set_xticklabels([f'λ={lambda_val}' for lambda_val in lambdas])
+    ax4.legend()
+    ax4.grid(True, alpha=0.3)
     
     plt.tight_layout()
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
@@ -449,6 +499,18 @@ if __name__ == "__main__":
                     print(f"  True Negative: {diag['sign_analysis']['true_negative']}")
                     print(f"  False Positive: {diag['sign_analysis']['false_positive']}")
                     print(f"  False Negative: {diag['sign_analysis']['false_negative']}")
+                    
+                    # Print new fairness metrics
+                    print(f"\nFairness Metrics:")
+                    print(f"  Direct Effect: {results.get('direct_effect', 'N/A'):.4f}")
+                    print(f"  Counterfactual Fairness: {results.get('counterfactual_fairness', 'N/A'):.4f}")
+                    if 'equalized_odds' in results:
+                        eo = results['equalized_odds']
+                        if 'treated' in eo:
+                            print(f"  Equalized Odds (Treated): TPR gap={eo['treated']['tpr_gap']:.4f}, FPR gap={eo['treated']['fpr_gap']:.4f}")
+                        if 'control' in eo:
+                            print(f"  Equalized Odds (Control): TPR gap={eo['control']['tpr_gap']:.4f}, FPR gap={eo['control']['fpr_gap']:.4f}")
+                    
                     print("=" * 50)
                 
                 # Try to get training losses from checkpoint if available
@@ -465,4 +527,3 @@ if __name__ == "__main__":
         print("Please run train_fair_cfrnet.py first to generate results.")
     
     print("\nEvaluation and visualization completed!")
-
