@@ -116,3 +116,32 @@ class TARNet(nn.Module):
             y1_pred = self.treatment_net(phi)
             ite = y1_pred - y0_pred
             return ite
+    
+    def _compute_mmd(self, x, y, sigma=1.0):
+        """
+        Compute MMD between two distributions.
+        
+        Parameters:
+        -----------
+        x : torch.Tensor
+            First distribution samples
+        y : torch.Tensor
+            Second distribution samples
+        sigma : float
+            Bandwidth parameter for RBF kernel
+        
+        Returns:
+        --------
+        mmd : torch.Tensor
+            MMD value
+        """
+        def rbf_kernel(x1, x2):
+            pairwise_dists = torch.cdist(x1, x2) ** 2
+            return torch.exp(-pairwise_dists / (2 * sigma ** 2))
+        
+        K_xx = rbf_kernel(x, x).mean()
+        K_yy = rbf_kernel(y, y).mean()
+        K_xy = rbf_kernel(x, y).mean()
+        
+        mmd = K_xx + K_yy - 2 * K_xy
+        return mmd

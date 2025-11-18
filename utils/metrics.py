@@ -138,7 +138,7 @@ def compute_causal_effect_penalty(y_pred_1, y_pred_0):
     return penalty
 
 
-def measure_direct_effect(model, X, A, device='cpu'):
+def measure_direct_effect(model, X, A, model_type='fair', device='cpu'):
     """
     Measure actual direct effect of A on predictions.
     
@@ -146,10 +146,12 @@ def measure_direct_effect(model, X, A, device='cpu'):
     -----------
     model : torch.nn.Module
         Trained model
-    X : torch.Tensor
+    X : np.ndarray
         Covariates [batch_size, input_dim]
-    A : torch.Tensor
+    A : np.ndarray
         Sensitive attribute [batch_size]
+    model_type : str
+        Type of model ('fair', 'baseline', etc.)
     device : str
         Device to use ('cuda' or 'cpu')
     
@@ -160,51 +162,23 @@ def measure_direct_effect(model, X, A, device='cpu'):
     """
     model.eval()
     X_tensor = torch.FloatTensor(X).to(device)
+    A_tensor = torch.FloatTensor(A).to(device)
     
     with torch.no_grad():
-        # Predict with A=0
-        A_zero = torch.zeros_like(A)
-        if hasattr(model, 'predict'):
-            Y_pred_a0 = model.predict(X_tensor, A_zero)
-        else:
-            # For FairCFRNet, we need to handle differently
-            if hasattr(model, 'forward') and 'A' in model.forward.__code__.co_varnames:
-                # Model takes A as input
-                if hasattr(model, 'compute_ite'):
-                    Y_pred_a0 = model.compute_ite(X_tensor, A_zero)
-                else:
-                    # Create dummy treatment if needed
-                    T_dummy = torch.zeros_like(A_zero)
-                    _, _, _, _, _, _, Y_pred_a0 = model(X_tensor, A_zero, T_dummy)
-            else:
-                # Model doesn't take A as input, use default behavior
-                Y_pred_a0 = model(X_tensor)
+        A_zero = torch.zeros_like(A_tensor)
+        A_one = torch.ones_like(A_tensor)
         
-        # Predict with A=1
-        A_one = torch.ones_like(A)
-        if hasattr(model, 'predict'):
-            Y_pred_a1 = model.predict(X_tensor, A_one)
+        if model_type == 'fair':
+            # FairCFRNet: use compute_ite which handles everything
+            ite_a0 = model.compute_ite(X_tensor, A_zero)
+            ite_a1 = model.compute_ite(X_tensor, A_one)
+            direct_effect = (ite_a1 - ite_a0).mean().item()
         else:
-            # For FairCFRNet, we need to handle differently
-            if hasattr(model, 'forward') and 'A' in model.forward.__code__.co_varnames:
-                # Model takes A as input
-                if hasattr(model, 'compute_ite'):
-                    Y_pred_a1 = model.compute_ite(X_tensor, A_one)
-                else:
-                    # Create dummy treatment if needed
-                    T_dummy = torch.zeros_like(A_one)
-                    _, _, _, _, _, _, Y_pred_a1 = model(X_tensor, A_one, T_dummy)
-            else:
-                # Model doesn't take A as input, use default behavior
-                Y_pred_a1 = model(X_tensor)
-        
-        # Direct effect
-        if isinstance(Y_pred_a0, tuple):
-            Y_pred_a0 = Y_pred_a0[0]
-        if isinstance(Y_pred_a1, tuple):
-            Y_pred_a1 = Y_pred_a1[0]
-            
-        direct_effect = (Y_pred_a1 - Y_pred_a0).mean().item()
+            # Baseline models: use compute_ite without A
+            ite_a0 = model.compute_ite(X_tensor)
+            ite_a1 = model.compute_ite(X_tensor)
+            # For baseline, direct effect is 0 by design (A not in model)
+            direct_effect = 0.0
     
     return direct_effect
 

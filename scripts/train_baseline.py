@@ -130,15 +130,12 @@ def train_baseline_model(model_type, X, T, Y, A, Y_cf=None, mu0=None, mu1=None, 
     elif model_type == 'tarnet':
         model = TARNet(input_dim=input_dim).to(device)
     elif model_type == 'naive_fair':
-        # Remove sensitive attribute from input
-        X_no_A = np.delete(X_scaled, 9, axis=1)  # Assuming x10 is at index 9
-        X_train_no_A = X_no_A[train_idx]
-        X_val_no_A = X_no_A[val_idx]
-        input_dim = X_train_no_A.shape[1]
+        # X already has A removed by preprocess_ihdp_data
+        # No need to remove again - just use X_scaled as is
+        input_dim = X_train.shape[1]
         
-        # Update datasets and loaders
-        train_dataset = IHDPDataset(X_train_no_A, T_train, Y_train, A_train)
-        val_dataset = IHDPDataset(X_val_no_A, T_val, Y_val, A_val)
+        train_dataset = IHDPDataset(X_train, T_train, Y_train, A_train)
+        val_dataset = IHDPDataset(X_val, T_val, Y_val, A_val)
         train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
         val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
         
@@ -178,7 +175,7 @@ def train_baseline_model(model_type, X, T, Y, A, Y_cf=None, mu0=None, mu1=None, 
             
             # Forward pass
             if model_type == 'adversarial':
-                y_pred, phi, a_pred = model(batch_X, batch_A, batch_T)
+                y_pred, phi, a_pred = model(batch_X, batch_T, batch_A)
             else:
                 y_pred, phi = model(batch_X, batch_T)
             
@@ -241,7 +238,7 @@ def train_baseline_model(model_type, X, T, Y, A, Y_cf=None, mu0=None, mu1=None, 
                 batch_A = batch_A.to(device)
                 
                 if model_type == 'adversarial':
-                    y_pred, phi, a_pred = model(batch_X, batch_A, batch_T)
+                    y_pred, phi, a_pred = model(batch_X, batch_T, batch_A)
                 else:
                     y_pred, phi = model(batch_X, batch_T)
                 
@@ -309,16 +306,11 @@ def train_baseline_model(model_type, X, T, Y, A, Y_cf=None, mu0=None, mu1=None, 
     model.eval()
     
     # Evaluate on full dataset
-    if model_type == 'naive_fair':
-        # Remove sensitive attribute from input
-        X_no_A = np.delete(X_scaled, 9, axis=1)  # Assuming x10 is at index 9
-        X_scaled_tensor = torch.FloatTensor(X_no_A).to(device)
-    else:
-        X_scaled_tensor = torch.FloatTensor(X_scaled).to(device)
+    X_scaled_tensor = torch.FloatTensor(X_scaled).to(device)
     
     with torch.no_grad():
         if model_type == 'adversarial':
-            _, phi, _ = model(X_scaled_tensor, torch.FloatTensor(A).to(device), torch.FloatTensor(T).to(device))
+            _, phi, _ = model(X_scaled_tensor, torch.FloatTensor(T).to(device), torch.FloatTensor(A).to(device))
         else:
             _, phi = model(X_scaled_tensor, torch.FloatTensor(T).to(device))
         ite_pred = model.compute_ite(X_scaled_tensor).cpu().numpy().flatten()
@@ -361,15 +353,12 @@ def train_baseline_model(model_type, X, T, Y, A, Y_cf=None, mu0=None, mu1=None, 
     y_pred_val = []
     with torch.no_grad():
         for batch_X, batch_T, _, batch_A in val_loader:
-            if model_type == 'naive_fair':
-                batch_X = batch_X.to(device)
-            else:
-                batch_X = batch_X.to(device)
-            
+            batch_X = batch_X.to(device)
             batch_T = batch_T.to(device)
+            batch_A = batch_A.to(device)
             
             if model_type == 'adversarial':
-                y_pred, _, _ = model(batch_X, batch_A, batch_T)
+                y_pred, _, _ = model(batch_X, batch_T, batch_A)
             else:
                 y_pred, _ = model(batch_X, batch_T)
             

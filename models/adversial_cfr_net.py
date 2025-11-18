@@ -101,7 +101,7 @@ class AdversarialCFRNet(CFRNet):
             dropout=dropout
         )
     
-    def forward(self, x, a=None, t=None):
+    def forward(self, x, t=None, a=None):
         """
         Forward pass through the network.
         
@@ -109,10 +109,10 @@ class AdversarialCFRNet(CFRNet):
         -----------
         x : torch.Tensor
             Input features [batch_size, input_dim]
-        a : torch.Tensor, optional
-            Sensitive attribute [batch_size]
         t : torch.Tensor, optional
             Treatment indicator [batch_size]
+        a : torch.Tensor, optional
+            Sensitive attribute [batch_size]
         
         Returns:
         --------

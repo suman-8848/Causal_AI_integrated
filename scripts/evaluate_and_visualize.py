@@ -260,13 +260,16 @@ def evaluate_model(model, X, T, Y, Y_cf, mu0, mu1, A, scaler, model_type='baseli
     fairness_penalty = None
     if model_type == 'fair' and hasattr(model, 'dce_module'):
         with torch.no_grad():
-            X_tensor_cpu = X_tensor.to(device)
-            A_tensor_cpu = A_tensor.to(device)
-            T_tensor_cpu = T_tensor.to(device)
-            fairness_penalty = model.dce_module(X_tensor_cpu, A_tensor_cpu, T_tensor_cpu).item()
+            # Get y_pred first from full forward pass
+            _, _, _, _, _, _, y_pred_full = model(X_tensor, A_tensor, T_tensor)
+            # Now call dce_module with all required arguments
+            pe_hat, _, _, _ = model.dce_module(
+                X_tensor, A_tensor, T_tensor, y_pred_full, model.propensity_net_a
+            )
+            fairness_penalty = pe_hat.item()
     
     # New fairness metrics
-    direct_effect = measure_direct_effect(model, X_scaled, A, device=device)
+    direct_effect = measure_direct_effect(model, X_scaled, A, model_type=model_type, device=device)
     
     # For counterfactual fairness, we need mediator predictions
     counterfactual_fairness = None
